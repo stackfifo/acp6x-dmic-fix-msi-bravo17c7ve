@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# rebuild_acp6xfix.sh — Télécharge les sources noyau, applique le patch
-#                        DMI "Bravo 17 C7VE", compile les modules ACP6x
-#                        et les installe en override.
+# rebuild_acp6xfix.sh — Download Kali kernel sources, apply the MSI Bravo 17 C7VE
+#                       ACP6x DMIC DMI quirk patch, build ACP6x modules, and
+#                       optionally install them as an override.
 #
-# Usage :
-#   sudo ./rebuild_acp6xfix.sh          # tout-en-un
-#   sudo ./rebuild_acp6xfix.sh --no-install   # compile seulement
+# Usage:
+#   sudo ./rebuild_acp6xfix.sh               # all-in-one: download → patch → build → install
+#   sudo ./rebuild_acp6xfix.sh --no-install  # download → patch → build only
 #
-# Pré-requis : dkms build-essential linux-headers-$(uname -r)
-#              deb-src activé dans /etc/apt/sources.list
-# ──────────────────────────────────────────────────────────────────────
+# Requirements:
+#   - build-essential, dkms (optional), linux-headers-$(uname -r), dpkg-dev
+#   - deb-src enabled in /etc/apt/sources.list (needed for: apt source linux)
+#
+# Notes:
+#   - The override is installed under /lib/modules/$(uname -r)/updates/acp6xfix/
+#     and is therefore specific to the currently running kernel version.
+#   - After a kernel update (uname -r changes), you must re-run this script.
+# ----------------------------------------------------------------------
 
 set -euo pipefail
 
-# ── Couleurs ─────────────────────────────────────────────────────────
+# ---- Colors ----------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -24,15 +30,20 @@ NC='\033[0m'
 info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-die()   { echo -e "${RED}[ERREUR]${NC} $*" >&2; exit 1; }
+die()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
-# ── Options ──────────────────────────────────────────────────────────
+# ---- Options ---------------------------------------------------------
 NO_INSTALL=0
 if [[ "${1:-}" == "--no-install" ]]; then
-    NO_INSTALL=1
+  NO_INSTALL=1
+elif [[ -n "${1:-}" ]]; then
+  die "Unknown option: ${1}. Supported: --no-install"
 fi
 
-# ── Variables ────────────────────────────────────────────────────────
+# ---- Require root early (script uses apt source + install) -----------
+[[ ${EUID:-999} -eq 0 ]] || die "This script must be run as root (use sudo)."
+
+# ---- Variables -------------------------------------------------------
 KVER="$(uname -r)"
 KDIR="/lib/modules/${KVER}/build"
 SRC_BASE="${HOME}/src"
@@ -42,161 +53,153 @@ PATCH_FILE="${REPO_DIR}/patches/0001-msi-bravo17-c7ve-add-dmi-quirk-acp6x.patch"
 OVERRIDE_DIR="/lib/modules/${KVER}/updates/acp6xfix"
 
 MODULES=(
-    snd-pci-acp6x.ko
-    snd-acp6x-pdm-dma.ko
-    snd-soc-acp6x-mach.ko
+  snd-pci-acp6x.ko
+  snd-acp6x-pdm-dma.ko
+  snd-soc-acp6x-mach.ko
 )
 
-echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}=======================================================${NC}"
 echo -e "${BOLD} ACP6x DMIC Fix — MSI Bravo 17 C7VE (MS-17LN)${NC}"
-echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}=======================================================${NC}"
+echo
+info "Running kernel : ${KVER}"
+info "Kernel headers : ${KDIR}"
 echo
 
-info "Kernel courant : ${KVER}"
-info "Headers noyau  : ${KDIR}"
-echo
-
-# ── pré-requis ──────────────────────────────────────────
-[[ -d "$KDIR" ]] || die "Headers noyau introuvables (${KDIR}). Installe : sudo apt install linux-headers-${KVER}"
+# ---- Preconditions ---------------------------------------------------
+[[ -d "${KDIR}" ]] || die "Kernel headers not found (${KDIR}). Install: sudo apt install linux-headers-${KVER}"
 
 for cmd in make gcc patch find install; do
-    command -v "$cmd" &>/dev/null || die "Commande '${cmd}' introuvable. Installe build-essential."
+  command -v "${cmd}" >/dev/null 2>&1 || die "Missing command '${cmd}'. Install: sudo apt install build-essential"
 done
 
-# ── Étape 1 : Télécharger les sources du noyau ──────────────────────
-info "Étape 1/5 — Téléchargement des sources noyau Kali ..."
-mkdir -p "$SRC_BASE"
-cd "$SRC_BASE"
+command -v apt >/dev/null 2>&1 || die "apt not found (unexpected on Kali/Debian)."
 
-# Si un dossier linux-* existe déjà avec nos sources, on le réutilise
-LINUX_DIR="$(find "$SRC_BASE" -maxdepth 1 -type d -name 'linux-*' | sort -V | tail -n 1 || true)"
+# ---- Step 1: Download kernel sources --------------------------------
+info "Step 1/5 — Fetching Kali kernel sources (apt source linux) ..."
+mkdir -p "${SRC_BASE}"
+cd "${SRC_BASE}"
 
-if [[ -z "$LINUX_DIR" ]] || [[ ! -f "${LINUX_DIR}/sound/soc/amd/yc/acp6x-mach.c" ]]; then
-    info "Téléchargement via apt source linux ..."
-    apt source linux 2>&1 | tail -5
-    LINUX_DIR="$(find "$SRC_BASE" -maxdepth 1 -type d -name 'linux-*' | sort -V | tail -n 1)"
+# Reuse an existing linux-* directory if present and looks correct
+LINUX_DIR="$(find "${SRC_BASE}" -maxdepth 1 -type d -name 'linux-*' | sort -V | tail -n 1 || true)"
+
+if [[ -z "${LINUX_DIR}" ]] || [[ ! -f "${LINUX_DIR}/sound/soc/amd/yc/acp6x-mach.c" ]]; then
+  info "Downloading sources via: apt source linux"
+  # apt source prints a lot; keep normal output but don't hide errors.
+  apt source linux
+  LINUX_DIR="$(find "${SRC_BASE}" -maxdepth 1 -type d -name 'linux-*' | sort -V | tail -n 1)"
 fi
 
-[[ -n "$LINUX_DIR" && -d "$LINUX_DIR" ]] || die "Impossible de trouver le dossier source du noyau."
-cd "$LINUX_DIR"
-ok "Sources noyau : ${LINUX_DIR}"
+[[ -n "${LINUX_DIR}" && -d "${LINUX_DIR}" ]] || die "Could not locate extracted kernel source directory under ${SRC_BASE}."
+cd "${LINUX_DIR}"
+ok "Kernel sources: ${LINUX_DIR}"
 echo
 
-# ── Étape 2 : vérifier / appliquer le patch DMI ─────────────────────
-info "Étape 2/5 — Application du patch DMI ..."
+# ---- Step 2: Apply/ensure DMI quirk ---------------------------------
+info "Step 2/5 — Applying DMI quirk patch ..."
 MACH_FILE="sound/soc/amd/yc/acp6x-mach.c"
 
-if grep -q '"Bravo 17 C7VE"' "$MACH_FILE" 2>/dev/null; then
-    ok "Le quirk 'Bravo 17 C7VE' est déjà présent — patch non nécessaire."
+[[ -f "${MACH_FILE}" ]] || die "Missing file: ${MACH_FILE}"
+
+if grep -q '"Bravo 17 C7VE"' "${MACH_FILE}" 2>/dev/null; then
+  ok "Quirk already present: Bravo 17 C7VE (nothing to do)."
 else
-    if [[ -f "$PATCH_FILE" ]]; then
-        # on tente le patch en premier
-        if patch --forward -p1 --dry-run < "$PATCH_FILE" &>/dev/null; then
-            patch --forward -p1 < "$PATCH_FILE"
-            ok "Patch appliqué depuis ${PATCH_FILE}"
-        else
-            warn "Le patch ne s'applique pas proprement — insertion manuelle."
-            # puis l'insertion manuelle
-            QUIRK_BLOCK=$'\t{\n\t\t.driver_data = &acp6x_card,\n\t\t.matches = {\n\t\t\tDMI_MATCH(DMI_BOARD_VENDOR, "Micro-Star International Co., Ltd."),\n\t\t\tDMI_MATCH(DMI_PRODUCT_NAME, "Bravo 17 C7VE"),\n\t\t}\n\t},'
-            # recherche de la dernière ligne de fermeture de la table
-            if grep -n '^	{}' "$MACH_FILE" | tail -1 | grep -q .; then
-                LINE=$(grep -n '^	{}' "$MACH_FILE" | tail -1 | cut -d: -f1)
-                head -n $((LINE - 1)) "$MACH_FILE" > "${MACH_FILE}.tmp"
-                printf '%s\n' "$QUIRK_BLOCK" >> "${MACH_FILE}.tmp"
-                tail -n +"$LINE" "$MACH_FILE" >> "${MACH_FILE}.tmp"
-                mv "${MACH_FILE}.tmp" "$MACH_FILE"
-                ok "Quirk 'Bravo 17 C7VE' inséré manuellement dans la table."
-            else
-                die "Impossible de trouver la fin de yc_acp_quirk_table[] dans ${MACH_FILE}"
-            fi
-        fi
+  if [[ -f "${PATCH_FILE}" ]]; then
+    # Try patch(1) first (works if PATCH_FILE is a unified diff)
+    if patch --forward -p1 --dry-run < "${PATCH_FILE}" >/dev/null 2>&1; then
+      patch --forward -p1 < "${PATCH_FILE}"
+      ok "Patch applied: ${PATCH_FILE}"
     else
-        warn "Fichier patch introuvable (${PATCH_FILE}) — insertion manuelle."
-        if grep -n '^	{}' "$MACH_FILE" | tail -1 | grep -q .; then
-            QUIRK_BLOCK=$'\t{\n\t\t.driver_data = &acp6x_card,\n\t\t.matches = {\n\t\t\tDMI_MATCH(DMI_BOARD_VENDOR, "Micro-Star International Co., Ltd."),\n\t\t\tDMI_MATCH(DMI_PRODUCT_NAME, "Bravo 17 C7VE"),\n\t\t}\n\t},'
-            LINE=$(grep -n '^	{}' "$MACH_FILE" | tail -1 | cut -d: -f1)
-            head -n $((LINE - 1)) "$MACH_FILE" > "${MACH_FILE}.tmp"
-            printf '%s\n' "$QUIRK_BLOCK" >> "${MACH_FILE}.tmp"
-            tail -n +"$LINE" "$MACH_FILE" >> "${MACH_FILE}.tmp"
-            mv "${MACH_FILE}.tmp" "$MACH_FILE"
-            ok "Quirk 'Bravo 17 C7VE' inséré manuellement."
-        else
-            die "Impossible de trouver la fin de yc_acp_quirk_table[]"
-        fi
+      warn "Patch does not apply cleanly with patch(1). Falling back to safe manual insertion."
+      # Manual insertion just before the final "{}" sentinel in yc_acp_quirk_table[]
+      QUIRK_BLOCK=$'\t{\n\t\t.driver_data = &acp6x_card,\n\t\t.matches = {\n\t\t\tDMI_MATCH(DMI_BOARD_VENDOR, "Micro-Star International Co., Ltd."),\n\t\t\tDMI_MATCH(DMI_PRODUCT_NAME, "Bravo 17 C7VE"),\n\t\t}\n\t},'
+      LINE="$(grep -n $'^\t{}' "${MACH_FILE}" | tail -1 | cut -d: -f1 || true)"
+      [[ -n "${LINE}" ]] || die "Could not find end-of-table sentinel (\"\\t{}\") in ${MACH_FILE}"
+      head -n $((LINE - 1)) "${MACH_FILE}" > "${MACH_FILE}.tmp"
+      printf '%s\n' "${QUIRK_BLOCK}" >> "${MACH_FILE}.tmp"
+      tail -n +"${LINE}" "${MACH_FILE}" >> "${MACH_FILE}.tmp"
+      mv "${MACH_FILE}.tmp" "${MACH_FILE}"
+      ok "Inserted DMI quirk block for Bravo 17 C7VE."
     fi
+  else
+    warn "Patch file not found: ${PATCH_FILE}. Falling back to manual insertion."
+    QUIRK_BLOCK=$'\t{\n\t\t.driver_data = &acp6x_card,\n\t\t.matches = {\n\t\t\tDMI_MATCH(DMI_BOARD_VENDOR, "Micro-Star International Co., Ltd."),\n\t\t\tDMI_MATCH(DMI_PRODUCT_NAME, "Bravo 17 C7VE"),\n\t\t}\n\t},'
+    LINE="$(grep -n $'^\t{}' "${MACH_FILE}" | tail -1 | cut -d: -f1 || true)"
+    [[ -n "${LINE}" ]] || die "Could not find end-of-table sentinel (\"\\t{}\") in ${MACH_FILE}"
+    head -n $((LINE - 1)) "${MACH_FILE}" > "${MACH_FILE}.tmp"
+    printf '%s\n' "${QUIRK_BLOCK}" >> "${MACH_FILE}.tmp"
+    tail -n +"${LINE}" "${MACH_FILE}" >> "${MACH_FILE}.tmp"
+    mv "${MACH_FILE}.tmp" "${MACH_FILE}"
+    ok "Inserted DMI quirk block for Bravo 17 C7VE."
+  fi
 fi
 
-# vérification
-grep -q '"Bravo 17 C7VE"' "$MACH_FILE" || die "Le quirk n'est pas présent après patch !"
+grep -q '"Bravo 17 C7VE"' "${MACH_FILE}" || die "Quirk not found after patch/insertion."
 echo
 
-# ── Étape 3 : Compilation des modules ACP6x ─────────────────────────
-info "Étape 3/5 — Compilation des modules ACP6x ..."
-make -C "$KDIR" M="$PWD/sound/soc/amd/yc" modules -j"$(nproc)" 2>&1 | tail -20
+# ---- Step 3: Build ACP6x modules ------------------------------------
+info "Step 3/5 — Building ACP6x modules ..."
+make -C "${KDIR}" M="$PWD/sound/soc/amd/yc" modules -j"$(nproc)"
 echo
 
-# Vérification
 FOUND=0
 for mod in "${MODULES[@]}"; do
-    if [[ -f "sound/soc/amd/yc/${mod}" ]]; then
-        ok "Compilé : ${mod}"
-        ((FOUND++))
-    else
-        warn "Absent  : ${mod}"
-    fi
+  if [[ -f "sound/soc/amd/yc/${mod}" ]]; then
+    ok "Built: ${mod}"
+    ((FOUND++))
+  else
+    warn "Missing after build: ${mod}"
+  fi
 done
 
-[[ $FOUND -gt 0 ]] || die "Aucun module compilé — la compilation a échoué."
+[[ ${FOUND} -gt 0 ]] || die "No modules were built — build failed."
 echo
 
-# ── Étape 4 : Installation override ─────────────────────────────────
-if [[ $NO_INSTALL -eq 1 ]]; then
-    info "Mode --no-install : les modules sont compilés dans :"
-    echo "    ${LINUX_DIR}/sound/soc/amd/yc/"
-    info "Pour installer manuellement :"
-    echo "    sudo ${REPO_DIR}/scripts/install_override.sh ${LINUX_DIR}/sound/soc/amd/yc"
-    exit 0
+# ---- Step 4: Install override (optional) -----------------------------
+if [[ ${NO_INSTALL} -eq 1 ]]; then
+  info "--no-install mode: modules are built under:"
+  echo "    ${LINUX_DIR}/sound/soc/amd/yc/"
+  info "To install later, run:"
+  echo "    sudo ${REPO_DIR}/scripts/install_override.sh"
+  exit 0
 fi
 
-[[ $EUID -eq 0 ]] || die "L'installation nécessite les droits root (sudo)."
-
-info "Étape 4/5 — Installation des modules en override ..."
-mkdir -p "$OVERRIDE_DIR"
+info "Step 4/5 — Installing override modules ..."
+mkdir -p "${OVERRIDE_DIR}"
 
 for mod in "${MODULES[@]}"; do
-    src="sound/soc/amd/yc/${mod}"
-    if [[ -f "$src" ]]; then
-        install -m 0644 "$src" "${OVERRIDE_DIR}/"
-        ok "Installé : ${OVERRIDE_DIR}/${mod}"
-    fi
+  src="sound/soc/amd/yc/${mod}"
+  if [[ -f "${src}" ]]; then
+    install -m 0644 "${src}" "${OVERRIDE_DIR}/"
+    ok "Installed: ${OVERRIDE_DIR}/${mod}"
+  fi
 done
 
-info "Exécution de depmod -a ..."
+info "Running depmod -a ..."
 depmod -a
-ok "depmod terminé."
+ok "depmod complete."
 echo
 
-# ── Étape 5 : Mise à jour initramfs ─────────────────────────────────
-info "Étape 5/5 — Mise à jour de l'initramfs ..."
-if command -v update-initramfs &>/dev/null; then
-    update-initramfs -u -k "${KVER}"
-    ok "initramfs mis à jour."
+# ---- Step 5: Update initramfs ---------------------------------------
+info "Step 5/5 — Updating initramfs ..."
+if command -v update-initramfs >/dev/null 2>&1; then
+  update-initramfs -u -k "${KVER}"
+  ok "initramfs updated."
 else
-    warn "update-initramfs introuvable — pense à régénérer l'initramfs manuellement."
+  warn "update-initramfs not found — regenerate initramfs manually if your system requires it."
 fi
 
 echo
-echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
-ok "Build + installation terminés avec succès !"
-echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}=======================================================${NC}"
+ok "Build + install completed successfully."
+echo -e "${BOLD}=======================================================${NC}"
 echo
-info "Redémarre maintenant :"
+info "Reboot recommended:"
 echo "    sudo systemctl reboot -i"
 echo
-info "Après reboot, vérifie :"
-echo "    dmesg | grep -i 'Enabling ACP DMIC support'"
+info "After reboot, verify:"
 echo "    pactl list short sources"
-echo "    arecord -l"
+echo "    pactl list sources | sed -n '/Name: alsa_input.*HiFi__Mic1__source/,/Active Port:/p'"
 echo
-info "Rollback si besoin :"
+info "Rollback (remove override):"
 echo "    sudo ${REPO_DIR}/scripts/rollback.sh"

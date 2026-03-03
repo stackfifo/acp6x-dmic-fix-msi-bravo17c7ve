@@ -1,112 +1,142 @@
 #!/usr/bin/env bash
-# install_override.sh — Installe les modules ACP6x patchés en override
-# Usage : sudo ./install_override.sh [chemin_vers_dossier_ko]
+# install_override.sh — Install ACP6xfix patched modules as an override
 #
-# Ce script :
-#   1. Copie les 3 modules .ko compilés dans /lib/modules/$(uname -r)/updates/acp6xfix/
-#   2. Exécute depmod -a
-#   3. Regénère l'initramfs
-#   4. Propose le reboot
+# Usage:
+#   sudo ./install_override.sh [PATH_TO_KO_DIR]
 #
-# Doit être exécuté en root (sudo).
-# ──────────────────────────────────────────────────────────────────────
+# What this script does:
+#   1) Copies the ACP6x-related .ko modules into:
+#        /lib/modules/$(uname -r)/updates/acp6xfix/
+#   2) Runs depmod -a
+#   3) Regenerates initramfs for the running kernel (if update-initramfs exists)
+#   4) Prints a reboot recommendation
+#
+# Notes:
+# - This override is kernel-version specific: if uname -r changes, you must reinstall.
+# - PipeWire sources may show SUSPENDED when idle; they switch to RUNNING when an app records.
+# ----------------------------------------------------------------------
 
 set -euo pipefail
 
-# ── Couleurs ─────────────────────────────────────────────────────────
+# ---- Colors ----------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+BOLD='\033[1m'
+NC='\033[0m'
 
 info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-die()   { echo -e "${RED}[ERREUR]${NC} $*" >&2; exit 1; }
+die()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
-# ── Vérification root ────────────────────────────────────────────────
-[[ $EUID -eq 0 ]] || die "Ce script doit être exécuté en root (sudo)."
+# ---- Require root ----------------------------------------------------
+[[ ${EUID:-999} -eq 0 ]] || die "This script must be run as root (use sudo)."
 
-# ── Paramètres ───────────────────────────────────────────────────────
+# ---- Kernel / paths --------------------------------------------------
 KVER="$(uname -r)"
 OVERRIDE_DIR="/lib/modules/${KVER}/updates/acp6xfix"
 
-# Dossier contenant les .ko compilés (argument ou auto-détection)
-KO_DIR="${1:-}"
-
-if [[ -z "$KO_DIR" ]]; then
-    # Tente une détection automatique dans ~/src/linux-*/sound/soc/amd/yc
-    for d in /home/*/src/linux-*/sound/soc/amd/yc; do
-        if compgen -G "${d}/*.ko" >/dev/null 2>&1; then
-            KO_DIR="$d"
-            break
-        fi
-    done
-fi
-
-[[ -n "$KO_DIR" && -d "$KO_DIR" ]] || die "Dossier des .ko introuvable. Usage : $0 /chemin/vers/sound/soc/amd/yc"
-
-# ── Liste des modules attendus ───────────────────────────────────────
+# ---- Expected modules ------------------------------------------------
 MODULES=(
-    snd-pci-acp6x.ko
-    snd-acp6x-pdm-dma.ko
-    snd-soc-acp6x-mach.ko
+  snd-pci-acp6x.ko
+  snd-acp6x-pdm-dma.ko
+  snd-soc-acp6x-mach.ko
 )
 
-info "Kernel courant   : ${KVER}"
-info "Dossier sources  : ${KO_DIR}"
-info "Dossier override : ${OVERRIDE_DIR}"
-echo
+# ---- KO directory (argument or auto-detect) --------------------------
+KO_DIR="${1:-}"
 
-# ── Vérifier que les .ko existent ────────────────────────────────────
-MISSING=0
-for mod in "${MODULES[@]}"; do
-    if [[ ! -f "${KO_DIR}/${mod}" ]]; then
-        warn "Module manquant : ${mod}"
-        MISSING=1
+auto_detect_ko_dir() {
+  # Prefer a source tree that matches the current kernel version if available.
+  # Fallback: newest ~/src/linux-*/sound/soc/amd/yc across /home/* users.
+  local best=""
+
+  # 1) Try current user first
+  for d in "${HOME}/src"/linux-*/sound/soc/amd/yc; do
+    [[ -d "${d}" ]] || continue
+    if compgen -G "${d}/*.ko" >/dev/null 2>&1; then
+      best="${d}"
     fi
-done
+  done
 
-if [[ $MISSING -eq 1 ]]; then
-    warn "Certains modules sont absents. On installe ceux qui existent."
+  # 2) Try other users (common on multi-user systems)
+  if [[ -z "${best}" ]]; then
+    for d in /home/*/src/linux-*/sound/soc/amd/yc; do
+      [[ -d "${d}" ]] || continue
+      if compgen -G "${d}/*.ko" >/dev/null 2>&1; then
+        best="${d}"
+      fi
+    done
+  fi
+
+  echo "${best}"
+}
+
+if [[ -z "${KO_DIR}" ]]; then
+  KO_DIR="$(auto_detect_ko_dir)"
 fi
 
-# ── Copier les modules ───────────────────────────────────────────────
-mkdir -p "$OVERRIDE_DIR"
+[[ -n "${KO_DIR}" && -d "${KO_DIR}" ]] || die "KO directory not found. Usage: sudo $0 /path/to/sound/soc/amd/yc"
 
-INSTALLED=0
+echo -e "${BOLD}=======================================================${NC}"
+echo -e "${BOLD} Install override — ACP6x DMIC Fix${NC}"
+echo -e "${BOLD}=======================================================${NC}"
+echo
+info "Running kernel : ${KVER}"
+info "KO directory   : ${KO_DIR}"
+info "Override dir   : ${OVERRIDE_DIR}"
+echo
+
+# ---- Validate presence of modules -----------------------------------
+missing=0
 for mod in "${MODULES[@]}"; do
-    src="${KO_DIR}/${mod}"
-    if [[ -f "$src" ]]; then
-        install -m 0644 "$src" "${OVERRIDE_DIR}/"
-        ok "Installé : ${mod}"
-        ((INSTALLED++))
-    fi
+  if [[ ! -f "${KO_DIR}/${mod}" ]]; then
+    warn "Missing module: ${mod}"
+    missing=1
+  fi
 done
 
-[[ $INSTALLED -gt 0 ]] || die "Aucun module installé — rien à faire."
+if [[ ${missing} -eq 1 ]]; then
+  warn "Some modules are missing. The script will install the ones that exist."
+fi
 
-# ── depmod ───────────────────────────────────────────────────────────
-info "Exécution de depmod -a ..."
+# ---- Copy modules ----------------------------------------------------
+mkdir -p "${OVERRIDE_DIR}"
+
+installed=0
+for mod in "${MODULES[@]}"; do
+  src="${KO_DIR}/${mod}"
+  if [[ -f "${src}" ]]; then
+    install -m 0644 "${src}" "${OVERRIDE_DIR}/"
+    ok "Installed: ${mod}"
+    ((installed++))
+  fi
+done
+
+[[ ${installed} -gt 0 ]] || die "No modules installed — nothing to do."
+
+# ---- depmod ----------------------------------------------------------
+info "Running depmod -a ..."
 depmod -a
-ok "depmod terminé."
+ok "depmod complete."
 
-# ── initramfs ────────────────────────────────────────────────────────
-if command -v update-initramfs &>/dev/null; then
-    info "Mise à jour de l'initramfs ..."
-    update-initramfs -u -k "${KVER}"
-    ok "initramfs mis à jour."
+# ---- initramfs -------------------------------------------------------
+if command -v update-initramfs >/dev/null 2>&1; then
+  info "Updating initramfs for ${KVER} ..."
+  update-initramfs -u -k "${KVER}"
+  ok "initramfs updated."
 else
-    warn "update-initramfs introuvable — pense à régénérer l'initramfs manuellement."
+  warn "update-initramfs not found — regenerate initramfs manually if your system requires it."
 fi
 
 echo
-ok "Installation terminée (${INSTALLED} module(s) dans ${OVERRIDE_DIR})."
+ok "Override install completed (${installed} module(s) in ${OVERRIDE_DIR})."
 echo
-info "Redémarre maintenant pour activer le fix :"
+info "Reboot recommended to ensure the stock modules are replaced by the override:"
 echo "    sudo systemctl reboot -i"
 echo
-info "Après reboot, vérifie avec :"
-echo "    dmesg | grep -i 'Enabling ACP DMIC support'"
+info "After reboot, verify:"
 echo "    pactl list short sources"
+echo "    pactl list sources | sed -n '/Name: alsa_input.*HiFi__Mic1__source/,/Active Port:/p'"
